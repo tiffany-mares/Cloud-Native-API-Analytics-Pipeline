@@ -9,6 +9,7 @@ Usage:
 import argparse
 import logging
 import sys
+import time
 import uuid
 from datetime import datetime, timezone
 from typing import Optional
@@ -18,6 +19,7 @@ from dotenv import load_dotenv
 from src.clients import ApiAClient, ApiBClient
 from src.transform import transform_records
 from src.utils import setup_logging, S3Writer
+from src.utils.pipeline_logger import PipelineLogger, timed_operation
 
 # Load environment variables
 load_dotenv()
@@ -41,42 +43,107 @@ def ingest_api_a(
         Ingestion result metadata
     """
     source = "api_a"
-    logger.info(f"Starting ingestion for {source}", extra={"batch_id": batch_id})
+    plog = PipelineLogger(source=source, batch_id=batch_id)
+    plog.start("ingestion")
+    
+    logger.info(
+        "Starting ingestion",
+        extra={
+            "source": source,
+            "batch_id": batch_id,
+            "since": since,
+            "step": "start",
+        }
+    )
     
     try:
-        # Fetch from API
-        client = ApiAClient()
-        raw_records = client.fetch(since=since)
+        # Fetch from API with timing
+        with timed_operation("api_fetch", logger) as fetch_timer:
+            client = ApiAClient()
+            raw_records = client.fetch(since=since)
+        
+        # Log API request metrics
+        api_metrics = client.metrics.to_dict()
+        logger.info(
+            "API fetch completed",
+            extra={
+                "source": source,
+                "batch_id": batch_id,
+                "step": "api_fetch",
+                "row_count": len(raw_records),
+                "duration_ms": round(fetch_timer.duration_ms, 2),
+                "retry_count": api_metrics["total_retries"],
+                "api_metrics": api_metrics,
+            }
+        )
         
         if not raw_records:
-            logger.warning(f"No records fetched from {source}")
+            plog.success("ingestion", row_count=0)
             return {
                 "source": source,
                 "batch_id": batch_id,
                 "status": "success",
                 "records_fetched": 0,
                 "records_staged": 0,
+                "api_metrics": api_metrics,
             }
         
-        # Transform: normalize, validate, dedupe
-        valid_records, invalid_records = transform_records(
-            raw_records,
-            required_fields=["id"],
-            timestamp_fields=["created_at", "updated_at"],
-            dedupe_key_fields=["id"],
-            dedupe_sort_field="updated_at",
-            normalize_keys=True,
-        )
-        
-        if invalid_records:
-            logger.warning(
-                f"Found {len(invalid_records)} invalid records",
-                extra={"source": source, "invalid_count": len(invalid_records)}
+        # Transform with timing
+        with timed_operation("transform", logger) as transform_timer:
+            valid_records, invalid_records = transform_records(
+                raw_records,
+                required_fields=["id"],
+                timestamp_fields=["created_at", "updated_at"],
+                dedupe_key_fields=["id"],
+                dedupe_sort_field="updated_at",
+                normalize_keys=True,
             )
         
-        # Upload to S3
-        writer = s3_writer or S3Writer()
-        metadata = writer.write(valid_records, source=source, batch_id=batch_id)
+        plog.log_transform(
+            input_count=len(raw_records),
+            output_count=len(valid_records),
+            invalid_count=len(invalid_records),
+            duration_ms=transform_timer.duration_ms,
+        )
+        
+        logger.info(
+            "Transform completed",
+            extra={
+                "source": source,
+                "batch_id": batch_id,
+                "step": "transform",
+                "input_count": len(raw_records),
+                "output_count": len(valid_records),
+                "invalid_count": len(invalid_records),
+                "duration_ms": round(transform_timer.duration_ms, 2),
+            }
+        )
+        
+        # Upload to S3 with timing
+        with timed_operation("s3_upload", logger) as upload_timer:
+            writer = s3_writer or S3Writer()
+            metadata = writer.write(valid_records, source=source, batch_id=batch_id)
+        
+        s3_path = metadata.get("s3_uri")
+        plog.log_s3_upload(
+            s3_path=s3_path,
+            row_count=metadata.get("record_count", 0),
+            file_size_bytes=metadata.get("file_size_bytes", 0),
+            duration_ms=upload_timer.duration_ms,
+        )
+        
+        logger.info(
+            "S3 upload completed",
+            extra={
+                "source": source,
+                "batch_id": batch_id,
+                "step": "s3_upload",
+                "s3_path": s3_path,
+                "row_count": metadata.get("record_count", 0),
+                "file_size_bytes": metadata.get("file_size_bytes", 0),
+                "duration_ms": round(upload_timer.duration_ms, 2),
+            }
+        )
         
         result = {
             "source": source,
@@ -86,15 +153,34 @@ def ingest_api_a(
             "records_valid": len(valid_records),
             "records_invalid": len(invalid_records),
             "records_staged": metadata.get("record_count", 0),
-            "s3_uri": metadata.get("s3_uri"),
+            "s3_uri": s3_path,
+            "s3_path": metadata.get("s3_key"),
             "file_size_bytes": metadata.get("file_size_bytes"),
+            "api_metrics": api_metrics,
+            "timings": {
+                "api_fetch_ms": round(fetch_timer.duration_ms, 2),
+                "transform_ms": round(transform_timer.duration_ms, 2),
+                "s3_upload_ms": round(upload_timer.duration_ms, 2),
+            },
         }
         
-        logger.info(f"Completed ingestion for {source}", extra=result)
+        plog.success("ingestion", row_count=len(valid_records), s3_path=s3_path)
+        logger.info("Ingestion completed successfully", extra=result)
         return result
         
     except Exception as e:
-        logger.error(f"Failed to ingest {source}: {e}", exc_info=True)
+        plog.error("ingestion", e)
+        logger.error(
+            "Ingestion failed",
+            extra={
+                "source": source,
+                "batch_id": batch_id,
+                "step": "error",
+                "error": str(e),
+                "retry_count": plog._retry_count,
+            },
+            exc_info=True
+        )
         return {
             "source": source,
             "batch_id": batch_id,
@@ -119,42 +205,107 @@ def ingest_api_b(
         Ingestion result metadata
     """
     source = "api_b"
-    logger.info(f"Starting ingestion for {source}", extra={"batch_id": batch_id})
+    plog = PipelineLogger(source=source, batch_id=batch_id)
+    plog.start("ingestion")
+    
+    logger.info(
+        "Starting ingestion",
+        extra={
+            "source": source,
+            "batch_id": batch_id,
+            "since": since,
+            "step": "start",
+        }
+    )
     
     try:
-        # Fetch from API
-        client = ApiBClient()
-        raw_records = client.fetch(since=since)
+        # Fetch from API with timing
+        with timed_operation("api_fetch", logger) as fetch_timer:
+            client = ApiBClient()
+            raw_records = client.fetch(since=since)
+        
+        # Log API request metrics
+        api_metrics = client.metrics.to_dict()
+        logger.info(
+            "API fetch completed",
+            extra={
+                "source": source,
+                "batch_id": batch_id,
+                "step": "api_fetch",
+                "row_count": len(raw_records),
+                "duration_ms": round(fetch_timer.duration_ms, 2),
+                "retry_count": api_metrics["total_retries"],
+                "api_metrics": api_metrics,
+            }
+        )
         
         if not raw_records:
-            logger.warning(f"No records fetched from {source}")
+            plog.success("ingestion", row_count=0)
             return {
                 "source": source,
                 "batch_id": batch_id,
                 "status": "success",
                 "records_fetched": 0,
                 "records_staged": 0,
+                "api_metrics": api_metrics,
             }
         
-        # Transform: normalize, validate, dedupe
-        valid_records, invalid_records = transform_records(
-            raw_records,
-            required_fields=["id"],
-            timestamp_fields=["created_at", "modified_at"],
-            dedupe_key_fields=["id"],
-            dedupe_sort_field="modified_at",
-            normalize_keys=True,
-        )
-        
-        if invalid_records:
-            logger.warning(
-                f"Found {len(invalid_records)} invalid records",
-                extra={"source": source, "invalid_count": len(invalid_records)}
+        # Transform with timing
+        with timed_operation("transform", logger) as transform_timer:
+            valid_records, invalid_records = transform_records(
+                raw_records,
+                required_fields=["id"],
+                timestamp_fields=["created_at", "modified_at"],
+                dedupe_key_fields=["id"],
+                dedupe_sort_field="modified_at",
+                normalize_keys=True,
             )
         
-        # Upload to S3
-        writer = s3_writer or S3Writer()
-        metadata = writer.write(valid_records, source=source, batch_id=batch_id)
+        plog.log_transform(
+            input_count=len(raw_records),
+            output_count=len(valid_records),
+            invalid_count=len(invalid_records),
+            duration_ms=transform_timer.duration_ms,
+        )
+        
+        logger.info(
+            "Transform completed",
+            extra={
+                "source": source,
+                "batch_id": batch_id,
+                "step": "transform",
+                "input_count": len(raw_records),
+                "output_count": len(valid_records),
+                "invalid_count": len(invalid_records),
+                "duration_ms": round(transform_timer.duration_ms, 2),
+            }
+        )
+        
+        # Upload to S3 with timing
+        with timed_operation("s3_upload", logger) as upload_timer:
+            writer = s3_writer or S3Writer()
+            metadata = writer.write(valid_records, source=source, batch_id=batch_id)
+        
+        s3_path = metadata.get("s3_uri")
+        plog.log_s3_upload(
+            s3_path=s3_path,
+            row_count=metadata.get("record_count", 0),
+            file_size_bytes=metadata.get("file_size_bytes", 0),
+            duration_ms=upload_timer.duration_ms,
+        )
+        
+        logger.info(
+            "S3 upload completed",
+            extra={
+                "source": source,
+                "batch_id": batch_id,
+                "step": "s3_upload",
+                "s3_path": s3_path,
+                "row_count": metadata.get("record_count", 0),
+                "file_size_bytes": metadata.get("file_size_bytes", 0),
+                "duration_ms": round(upload_timer.duration_ms, 2),
+            }
+        )
         
         result = {
             "source": source,
@@ -164,15 +315,34 @@ def ingest_api_b(
             "records_valid": len(valid_records),
             "records_invalid": len(invalid_records),
             "records_staged": metadata.get("record_count", 0),
-            "s3_uri": metadata.get("s3_uri"),
+            "s3_uri": s3_path,
+            "s3_path": metadata.get("s3_key"),
             "file_size_bytes": metadata.get("file_size_bytes"),
+            "api_metrics": api_metrics,
+            "timings": {
+                "api_fetch_ms": round(fetch_timer.duration_ms, 2),
+                "transform_ms": round(transform_timer.duration_ms, 2),
+                "s3_upload_ms": round(upload_timer.duration_ms, 2),
+            },
         }
         
-        logger.info(f"Completed ingestion for {source}", extra=result)
+        plog.success("ingestion", row_count=len(valid_records), s3_path=s3_path)
+        logger.info("Ingestion completed successfully", extra=result)
         return result
         
     except Exception as e:
-        logger.error(f"Failed to ingest {source}: {e}", exc_info=True)
+        plog.error("ingestion", e)
+        logger.error(
+            "Ingestion failed",
+            extra={
+                "source": source,
+                "batch_id": batch_id,
+                "step": "error",
+                "error": str(e),
+                "retry_count": plog._retry_count,
+            },
+            exc_info=True
+        )
         return {
             "source": source,
             "batch_id": batch_id,
