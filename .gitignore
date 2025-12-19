@@ -1,0 +1,49 @@
+# Environment & Secrets
+.env
+.env.local
+.env.*.local
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+coverage.xml
+
+# Logs
+*.log
+logs/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# Data files (local)
+*.jsonl
+*.parquet
+data/
+staging/
+
+# Airflow
+airflow.db
+airflow-webserver.pid
+
+# OS
+.DS_Store
+Thumbs.db
