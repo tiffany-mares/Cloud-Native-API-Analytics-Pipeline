@@ -6,6 +6,12 @@ from src.transform.normalize import (
     normalize_timestamp,
     normalize_key,
     normalize_record,
+    validate_required_fields,
+    validate_records,
+    dedupe_records,
+    dedupe_by_id_updated,
+    transform_records,
+    ValidationError,
 )
 
 
@@ -136,3 +142,192 @@ class TestNormalizeRecord:
         
         assert "camelCase" in result
 
+
+class TestValidation:
+    """Tests for record validation."""
+    
+    def test_validate_required_fields_pass(self):
+        """Test validation passes with all required fields."""
+        record = {"id": "123", "name": "Test", "value": 100}
+        result = validate_required_fields(record, ["id", "name"])
+        
+        assert result.is_valid is True
+        assert result.errors == []
+    
+    def test_validate_required_fields_missing(self):
+        """Test validation fails with missing field."""
+        record = {"id": "123"}
+        result = validate_required_fields(record, ["id", "name"])
+        
+        assert result.is_valid is False
+        assert "Missing required field: name" in result.errors
+    
+    def test_validate_required_fields_null(self):
+        """Test validation fails with null value."""
+        record = {"id": "123", "name": None}
+        result = validate_required_fields(record, ["id", "name"])
+        
+        assert result.is_valid is False
+        assert "Null value for required field: name" in result.errors
+    
+    def test_validate_required_fields_empty_string(self):
+        """Test validation fails with empty string."""
+        record = {"id": "123", "name": "   "}
+        result = validate_required_fields(record, ["id", "name"])
+        
+        assert result.is_valid is False
+        assert "Empty value for required field: name" in result.errors
+    
+    def test_validate_records_batch(self):
+        """Test batch validation."""
+        records = [
+            {"id": "1", "name": "Valid"},
+            {"id": "2", "name": None},
+            {"id": "3", "name": "Also Valid"},
+        ]
+        valid, invalid = validate_records(records, ["id", "name"])
+        
+        assert len(valid) == 2
+        assert len(invalid) == 1
+        assert invalid[0]["id"] == "2"
+    
+    def test_validate_records_raise_on_error(self):
+        """Test validation raises exception when requested."""
+        records = [{"id": "1"}]
+        
+        with pytest.raises(ValidationError) as exc_info:
+            validate_records(records, ["id", "name"], raise_on_error=True)
+        
+        assert "name" in str(exc_info.value.errors)
+
+
+class TestDeduplication:
+    """Tests for record deduplication."""
+    
+    def test_dedupe_by_single_key(self):
+        """Test deduplication by single key field."""
+        records = [
+            {"id": "1", "value": "first"},
+            {"id": "2", "value": "unique"},
+            {"id": "1", "value": "second"},
+        ]
+        result = dedupe_records(records, key_fields=["id"])
+        
+        assert len(result) == 2
+    
+    def test_dedupe_keep_last(self):
+        """Test keeping last duplicate."""
+        records = [
+            {"id": "1", "updated_at": "2025-01-01", "value": "old"},
+            {"id": "1", "updated_at": "2025-01-02", "value": "new"},
+        ]
+        result = dedupe_records(
+            records,
+            key_fields=["id"],
+            sort_field="updated_at",
+            keep="last",
+        )
+        
+        assert len(result) == 1
+        assert result[0]["value"] == "new"
+    
+    def test_dedupe_keep_first(self):
+        """Test keeping first duplicate."""
+        records = [
+            {"id": "1", "updated_at": "2025-01-01", "value": "old"},
+            {"id": "1", "updated_at": "2025-01-02", "value": "new"},
+        ]
+        result = dedupe_records(
+            records,
+            key_fields=["id"],
+            sort_field="updated_at",
+            keep="first",
+        )
+        
+        assert len(result) == 1
+        assert result[0]["value"] == "old"
+    
+    def test_dedupe_composite_key(self):
+        """Test deduplication with composite key."""
+        records = [
+            {"id": "1", "date": "2025-01-01", "value": "a"},
+            {"id": "1", "date": "2025-01-02", "value": "b"},
+            {"id": "1", "date": "2025-01-01", "value": "c"},  # Duplicate
+        ]
+        result = dedupe_records(records, key_fields=["id", "date"])
+        
+        assert len(result) == 2
+    
+    def test_dedupe_by_id_updated_convenience(self):
+        """Test convenience function for id+updated_at deduplication."""
+        records = [
+            {"id": "1", "updated_at": "2025-01-01", "value": "old"},
+            {"id": "1", "updated_at": "2025-01-02", "value": "new"},
+            {"id": "2", "updated_at": "2025-01-01", "value": "other"},
+        ]
+        result = dedupe_by_id_updated(records)
+        
+        assert len(result) == 2
+        # Should have the latest version of id=1
+        id1_record = next(r for r in result if r["id"] == "1")
+        assert id1_record["value"] == "new"
+    
+    def test_dedupe_empty_list(self):
+        """Test deduplication of empty list."""
+        result = dedupe_records([], key_fields=["id"])
+        assert result == []
+    
+    def test_dedupe_skips_null_keys(self):
+        """Test that records with null key fields are skipped."""
+        records = [
+            {"id": "1", "value": "valid"},
+            {"id": None, "value": "invalid"},
+        ]
+        result = dedupe_records(records, key_fields=["id"])
+        
+        assert len(result) == 1
+        assert result[0]["id"] == "1"
+
+
+class TestTransformPipeline:
+    """Tests for full transformation pipeline."""
+    
+    def test_transform_records_full_pipeline(self):
+        """Test complete transformation pipeline."""
+        records = [
+            {"id": "1", "name": "First", "createdAt": "2025-01-01T00:00:00Z"},
+            {"id": "2", "name": "Second", "createdAt": "2025-01-02T00:00:00Z"},
+            {"id": "1", "name": "Updated", "createdAt": "2025-01-03T00:00:00Z"},
+        ]
+        
+        valid, invalid = transform_records(
+            records,
+            required_fields=["id", "name"],
+            timestamp_fields=["created_at"],
+            dedupe_key_fields=["id"],
+            dedupe_sort_field="created_at",
+            normalize_keys=True,
+        )
+        
+        # Should have 2 records after deduplication
+        assert len(valid) == 2
+        assert len(invalid) == 0
+        
+        # Keys should be normalized
+        assert all("created_at" in r for r in valid)
+    
+    def test_transform_records_with_invalid(self):
+        """Test pipeline with some invalid records."""
+        records = [
+            {"id": "1", "name": "Valid"},
+            {"id": "2", "name": None},  # Invalid
+            {"id": "3", "name": "Also Valid"},
+        ]
+        
+        valid, invalid = transform_records(
+            records,
+            required_fields=["id", "name"],
+        )
+        
+        assert len(valid) == 2
+        assert len(invalid) == 1
