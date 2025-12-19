@@ -4,5 +4,6 @@ pyarrow
 boto3
 python-dotenv
 snowflake-connector-python
+apache-airflow-providers-snowflake
 pytest
 ruff
