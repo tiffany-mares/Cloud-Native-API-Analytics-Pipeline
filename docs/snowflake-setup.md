@@ -181,19 +181,64 @@ SELECT SYSTEM$PIPE_STATUS('pipe_api_a');
 
 ---
 
+---
+
+## Phase 5: Load & Transform (RAW → CLEAN)
+
+### Step 19: Test Snowpipe Refresh
+
+Run the SQL script: `sql/06_refresh_pipes.sql`
+
+```sql
+-- Trigger pipe refresh
+ALTER PIPE pipe_api_a REFRESH;
+ALTER PIPE pipe_api_b REFRESH;
+
+-- Verify data loaded
+SELECT COUNT(*) FROM RAW.API_A_EVENTS;
+SELECT COUNT(*) FROM RAW.API_B_EVENTS;
+```
+
+### Step 20: Build CLEAN Tables
+
+Run the SQL script: `sql/07_clean_tables.sql`
+
+**Pattern: Parse JSON + Dedupe with QUALIFY**
+
+```sql
+CREATE OR REPLACE TABLE CLEAN.CLN_API_A_EVENTS AS
+SELECT
+    payload:id::STRING AS id,
+    payload:updated_at::TIMESTAMP_NTZ AS updated_at,
+    payload:name::STRING AS name,
+    -- ... more fields
+    ingested_at,
+    batch_id
+FROM RAW.API_A_EVENTS
+QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY payload:id::STRING 
+    ORDER BY payload:updated_at::TIMESTAMP_NTZ DESC
+) = 1;
+```
+
+**Incremental Updates**: Use `sql/08_clean_incremental.sql` for MERGE-based updates.
+
+---
+
 ## Summary
 
-1. ✅ Database created: `VIDEO_ANALYTICS`
-2. ✅ Schemas created: `RAW`, `CLEAN`, `ANALYTICS`
-3. ✅ Warehouse created: `PIPELINE_WH`
-4. ✅ Storage integration: `s3_int_motorola`
-5. ✅ AWS trust relationship updated
-6. ✅ File format: `ff_jsonl`
-7. ✅ External stage: `s3_stage_motorola`
-8. ✅ RAW tables: `API_A_EVENTS`, `API_B_EVENTS`
-9. ✅ Snowpipes: `pipe_api_a`, `pipe_api_b`
+| Step | Script | Objects Created |
+|------|--------|-----------------|
+| 8 | `01_database_setup.sql` | DATABASE, SCHEMAS, WAREHOUSE |
+| 9 | `02_storage_integration.sql` | STORAGE INTEGRATION |
+| 11 | `03_stage_and_format.sql` | FILE FORMAT, STAGE |
+| 12 | `04_raw_tables.sql` | RAW tables |
+| 13 | `05_snowpipes.sql` | Snowpipes |
+| 19 | `06_refresh_pipes.sql` | (test refresh) |
+| 20 | `07_clean_tables.sql` | CLEAN tables |
+| 20+ | `08_clean_incremental.sql` | (incremental MERGE) |
 
 ## Next Steps
 
-→ Phase 4: Python Ingestion Scripts
+→ Phase 5 continued: Analytics Layer (Step 21)
 
