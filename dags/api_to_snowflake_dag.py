@@ -136,13 +136,15 @@ def ingest_api_data_to_s3(**context) -> dict:
 
 
 def run_data_quality_checks(**context) -> dict:
-    """Run data quality checks on loaded data.
+    """Validate data quality check results from DQ_CHECK_RESULTS table.
     
-    Checks:
-    - Freshness: data arrived within expected window
-    - Row counts: not zero, within expected range
-    - Null checks: primary keys not null
-    - Duplicates: no duplicate primary keys
+    Reads results inserted by the SQL DQ checks and determines pass/fail.
+    
+    Checks validated:
+    - Row count > 0 for each CLEAN table
+    - No NULL primary keys
+    - Freshness within 6 hours
+    - No duplicate primary keys
     
     Returns:
         dict: DQ check results
@@ -158,106 +160,87 @@ def run_data_quality_checks(**context) -> dict:
         database=os.getenv("SNOWFLAKE_DATABASE", "VIDEO_ANALYTICS"),
     )
     
-    checks = []
     cursor = conn.cursor()
     
     try:
-        # Check 1: Freshness - data loaded in last 2 hours
+        # Get results from most recent DQ run (last 5 minutes)
         cursor.execute("""
             SELECT 
-                source,
-                freshness_status,
-                ingestion_age_minutes
-            FROM ANALYTICS.VW_DATA_FRESHNESS
+                check_name,
+                check_type,
+                table_name,
+                result_value,
+                threshold_value,
+                passed,
+                error_message,
+                executed_at
+            FROM ANALYTICS.DQ_CHECK_RESULTS
+            WHERE executed_at >= DATEADD(MINUTE, -5, CURRENT_TIMESTAMP())
+            ORDER BY executed_at DESC
         """)
-        freshness_results = cursor.fetchall()
         
-        for source, status, age_minutes in freshness_results:
-            check = {
-                "check": "freshness",
-                "source": source,
-                "status": status,
-                "age_minutes": age_minutes,
-                "passed": status != "STALE",
-            }
-            checks.append(check)
-            logger.info(f"Freshness check: {check}")
+        results = cursor.fetchall()
+        columns = ["check_name", "check_type", "table_name", "result_value", 
+                   "threshold_value", "passed", "error_message", "executed_at"]
         
-        # Check 2: Row counts - not empty
-        for table in ["CLN_API_A_EVENTS", "CLN_API_B_EVENTS"]:
-            cursor.execute(f"SELECT COUNT(*) FROM CLEAN.{table}")
-            count = cursor.fetchone()[0]
-            check = {
-                "check": "row_count",
-                "table": table,
-                "count": count,
-                "passed": count > 0,
-            }
+        checks = []
+        for row in results:
+            check = dict(zip(columns, row))
+            check["executed_at"] = str(check["executed_at"])
             checks.append(check)
-            logger.info(f"Row count check: {check}")
+            
+            status = "✓ PASSED" if check["passed"] else "✗ FAILED"
+            logger.info(
+                f"DQ Check: {check['check_name']} on {check['table_name']} - {status}",
+                extra=check
+            )
         
-        # Check 3: Null primary keys
-        for table, pk_col in [("CLN_API_A_EVENTS", "id"), ("CLN_API_B_EVENTS", "id")]:
-            cursor.execute(f"""
-                SELECT COUNT(*) 
-                FROM CLEAN.{table} 
-                WHERE {pk_col} IS NULL
-            """)
-            null_count = cursor.fetchone()[0]
-            check = {
-                "check": "null_pk",
-                "table": table,
-                "null_count": null_count,
-                "passed": null_count == 0,
-            }
-            checks.append(check)
-            logger.info(f"Null PK check: {check}")
+        # Get summary
+        cursor.execute("""
+            SELECT
+                COUNT(*) AS total_checks,
+                SUM(CASE WHEN passed THEN 1 ELSE 0 END) AS passed_checks,
+                SUM(CASE WHEN NOT passed THEN 1 ELSE 0 END) AS failed_checks
+            FROM ANALYTICS.DQ_CHECK_RESULTS
+            WHERE executed_at >= DATEADD(MINUTE, -5, CURRENT_TIMESTAMP())
+        """)
         
-        # Check 4: Duplicates
-        for table, pk_col in [("CLN_API_A_EVENTS", "id"), ("CLN_API_B_EVENTS", "id")]:
-            cursor.execute(f"""
-                SELECT COUNT(*) FROM (
-                    SELECT {pk_col}, COUNT(*) AS cnt
-                    FROM CLEAN.{table}
-                    GROUP BY {pk_col}
-                    HAVING cnt > 1
-                )
-            """)
-            dup_count = cursor.fetchone()[0]
-            check = {
-                "check": "duplicates",
-                "table": table,
-                "duplicate_count": dup_count,
-                "passed": dup_count == 0,
-            }
-            checks.append(check)
-            logger.info(f"Duplicate check: {check}")
+        summary = cursor.fetchone()
+        total, passed, failed = summary
         
     finally:
         cursor.close()
         conn.close()
     
-    # Summarize results
-    passed = sum(1 for c in checks if c["passed"])
-    failed = sum(1 for c in checks if not c["passed"])
-    
     result = {
-        "total_checks": len(checks),
-        "passed": passed,
-        "failed": failed,
+        "total_checks": total or 0,
+        "passed": passed or 0,
+        "failed": failed or 0,
         "checks": checks,
     }
     
     context["ti"].xcom_push(key="dq_results", value=result)
     
-    if failed > 0:
-        logger.warning(f"DQ checks completed with {failed} failures")
-        # Optionally raise exception for critical failures
-        critical_failures = [c for c in checks if not c["passed"] and c["check"] in ["null_pk", "duplicates"]]
+    if failed and failed > 0:
+        # Get failed checks for error message
+        failed_checks = [c for c in checks if not c["passed"]]
+        
+        logger.warning(
+            f"DQ checks completed with {failed} failures",
+            extra={"failed_checks": failed_checks}
+        )
+        
+        # Raise exception for critical failures (null PKs, duplicates)
+        critical_failures = [
+            c for c in failed_checks 
+            if c["check_name"] in ["null_primary_key_check", "duplicate_primary_key_check"]
+        ]
+        
         if critical_failures:
-            raise Exception(f"Critical DQ check failures: {critical_failures}")
+            error_messages = [c["error_message"] for c in critical_failures]
+            raise Exception(f"Critical DQ check failures: {error_messages}")
     else:
-        logger.info(f"All {passed} DQ checks passed")
+        logger.info(f"All {passed} DQ checks passed ✓")
     
     return result
 
@@ -401,10 +384,20 @@ with DAG(
     )
     
     # ========================================
-    # Task 6: Data Quality Checks
+    # Task 6: Data Quality Checks (SQL-based)
     # ========================================
+    
+    # Run DQ check SQL (inserts results to DQ_CHECK_RESULTS table)
+    run_dq_checks_sql = SnowflakeOperator(
+        task_id="run_dq_checks_sql",
+        snowflake_conn_id=SNOWFLAKE_CONN_ID,
+        sql="/opt/airflow/sql/10_data_quality_checks.sql",
+        on_failure_callback=on_failure_callback,
+    )
+    
+    # Validate DQ results (Python check for failures)
     dq_checks = PythonOperator(
-        task_id="run_dq_checks",
+        task_id="validate_dq_results",
         python_callable=run_data_quality_checks,
         on_failure_callback=on_failure_callback,
     )
@@ -441,8 +434,8 @@ with DAG(
     [refresh_pipe_api_a, refresh_pipe_api_b] >> wait_for_load
     wait_for_load >> run_clean_sql >> run_analytics_sql
     
-    # DQ checks after analytics
-    run_analytics_sql >> dq_checks
+    # DQ checks after analytics (SQL insert → Python validation)
+    run_analytics_sql >> run_dq_checks_sql >> dq_checks
     
     # Always publish metrics and end
     dq_checks >> publish_metrics >> end
