@@ -1,5 +1,9 @@
 version: '3.8'
 
+# ============================================
+# Airflow Local Development Setup
+# ============================================
+
 x-airflow-common: &airflow-common
   build:
     context: .
@@ -10,30 +14,43 @@ x-airflow-common: &airflow-common
     AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
     AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
     AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
-    AIRFLOW__WEBSERVER__SECRET_KEY: 'your-secret-key-here'
+    AIRFLOW__WEBSERVER__SECRET_KEY: 'supersecretkey123'
     AIRFLOW__WEBSERVER__EXPOSE_CONFIG: 'true'
-    # Pipeline configuration
-    SNOWFLAKE_ACCOUNT: ${SNOWFLAKE_ACCOUNT}
-    SNOWFLAKE_USER: ${SNOWFLAKE_USER}
-    SNOWFLAKE_PASSWORD: ${SNOWFLAKE_PASSWORD}
-    SNOWFLAKE_DATABASE: ${SNOWFLAKE_DATABASE}
-    SNOWFLAKE_WAREHOUSE: ${SNOWFLAKE_WAREHOUSE}
-    SNOWFLAKE_SCHEMA: ${SNOWFLAKE_SCHEMA}
-    AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
-    AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
-    S3_BUCKET: ${S3_BUCKET}
+    # Python path for src imports
+    PYTHONPATH: '/opt/airflow/src:/opt/airflow'
+    # Pipeline environment variables (override in .env)
+    SNOWFLAKE_ACCOUNT: ${SNOWFLAKE_ACCOUNT:-}
+    SNOWFLAKE_USER: ${SNOWFLAKE_USER:-}
+    SNOWFLAKE_PASSWORD: ${SNOWFLAKE_PASSWORD:-}
+    SNOWFLAKE_DATABASE: ${SNOWFLAKE_DATABASE:-VIDEO_ANALYTICS}
+    SNOWFLAKE_WAREHOUSE: ${SNOWFLAKE_WAREHOUSE:-PIPELINE_WH}
+    SNOWFLAKE_SCHEMA: ${SNOWFLAKE_SCHEMA:-RAW}
+    AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+    AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+    AWS_REGION: ${AWS_REGION:-us-east-1}
+    S3_BUCKET: ${S3_BUCKET:-}
+    API_A_BASE_URL: ${API_A_BASE_URL:-}
+    API_A_OAUTH_CLIENT_ID: ${API_A_OAUTH_CLIENT_ID:-}
+    API_A_OAUTH_CLIENT_SECRET: ${API_A_OAUTH_CLIENT_SECRET:-}
+    API_A_OAUTH_TOKEN_URL: ${API_A_OAUTH_TOKEN_URL:-}
+    API_B_BASE_URL: ${API_B_BASE_URL:-}
+    API_B_API_KEY: ${API_B_API_KEY:-}
   volumes:
     - ./dags:/opt/airflow/dags
     - ./src:/opt/airflow/src
     - ./logs:/opt/airflow/logs
-    - ./plugins:/opt/airflow/plugins
+    - ./sql:/opt/airflow/sql
+  user: "${AIRFLOW_UID:-50000}:0"
   depends_on:
     postgres:
       condition: service_healthy
 
 services:
+  # ==========================================
+  # PostgreSQL (Airflow metadata database)
+  # ==========================================
   postgres:
-    image: postgres:15
+    image: postgres:15-alpine
     environment:
       POSTGRES_USER: airflow
       POSTGRES_PASSWORD: airflow
@@ -48,12 +65,16 @@ services:
     ports:
       - "5432:5432"
 
+  # ==========================================
+  # Airflow Init (database + admin user)
+  # ==========================================
   airflow-init:
     <<: *airflow-common
     entrypoint: /bin/bash
     command:
       - -c
       - |
+        echo "Initializing Airflow..."
         airflow db init
         airflow users create \
           --username admin \
@@ -62,8 +83,12 @@ services:
           --role Admin \
           --email admin@example.com \
           --password admin
+        echo "Airflow initialized successfully!"
     restart: "no"
 
+  # ==========================================
+  # Airflow Webserver (UI)
+  # ==========================================
   airflow-webserver:
     <<: *airflow-common
     command: webserver
@@ -76,6 +101,9 @@ services:
       retries: 5
     restart: always
 
+  # ==========================================
+  # Airflow Scheduler
+  # ==========================================
   airflow-scheduler:
     <<: *airflow-common
     command: scheduler
@@ -86,33 +114,22 @@ services:
       retries: 5
     restart: always
 
-  # Local development services
+  # ==========================================
+  # LocalStack (S3 mock for local testing)
+  # ==========================================
   localstack:
     image: localstack/localstack:latest
     ports:
       - "4566:4566"
     environment:
       - SERVICES=s3
-      - DEBUG=1
+      - DEBUG=0
       - DATA_DIR=/var/lib/localstack/data
     volumes:
       - localstack-data:/var/lib/localstack
-
-  # MinIO as S3 alternative (optional)
-  minio:
-    image: minio/minio:latest
-    ports:
-      - "9000:9000"
-      - "9001:9001"
-    environment:
-      MINIO_ROOT_USER: minioadmin
-      MINIO_ROOT_PASSWORD: minioadmin
-    command: server /data --console-address ":9001"
-    volumes:
-      - minio-data:/data
+    profiles:
+      - local-s3
 
 volumes:
   postgres-db-volume:
   localstack-data:
-  minio-data:
-
